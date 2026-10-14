@@ -353,14 +353,65 @@
     }
 
     // Loads save state if exists in the browser memory
+    // ------------------------------------------------------------------
+    // 存档版本保护
+    // ------------------------------------------------------------------
+    //  ink 的存档（state）是拿「内容路径」记录进度的，只在**同一份编译产物**
+    //  里有效。剧本改版之后（例如 v1.3 -> v1.4）把旧存档硬载进来，故事会停在
+    //  一个不存在的位置上：没有正文、也没有选项，网页看起来就是一片空白，
+    //  必须按一下 restart（ResetState）才正常 —— 而 restart 并不会清掉旧存档，
+    //  于是每次打开都是白屏。
+    //
+    //  下面做两件事：
+    //    ① 给存档打上当前剧本的指纹，指纹不符直接忽略（并清掉旧存档）；
+    //    ② 载入之后校验故事是否真的能继续/有选项，不能就丢弃这份存档。
+    function storyFingerprint() {
+        var text = typeof storyContent === "string" ? storyContent : JSON.stringify(storyContent);
+        var hash = 5381;
+        for (var i = 0; i < text.length; i++) hash = ((hash << 5) + hash + text.charCodeAt(i)) | 0;
+        return (hash >>> 0) + ":" + text.length;
+    }
+
+    /** 取出「属于当前剧本、而且载入后确实有内容」的存档；没有就返回 null */
+    function readValidSave() {
+        var savedState = window.localStorage.getItem('save-state');
+        if (!savedState) return null;
+
+        var savedFor = window.localStorage.getItem('save-state-for');
+        if (savedFor && savedFor !== storyFingerprint()) {
+            console.debug("存档属于另一个版本的剧本，已忽略并清除");
+            window.localStorage.removeItem('save-state');
+            return null;
+        }
+
+        try {
+            story.state.LoadJson(savedState);
+        } catch (e) {
+            // 旧版本 / 损坏的存档会让 inkjs 找不到内容路径而抛错
+            // （例如 "Failed to find content at path 'ch3.0.9'"）。
+            // 注意：抛错之后 story 内部状态已经不可信了，拿"载入前的快照"塞回去也没用
+            //（实测仍然是坏状态），必须用 ResetState() 回到故事开头 ——
+            // 这正是 restart 按钮干的事。
+            console.debug("存档载入失败，从故事开头开始：", e.message);
+            window.localStorage.removeItem('save-state');
+            story.ResetState();
+            return null;
+        }
+
+        if (!story.canContinue && story.currentChoices.length === 0) {
+            console.debug("存档载入后故事是空的，已忽略并清除");
+            window.localStorage.removeItem('save-state');
+            story.ResetState();
+            return null;
+        }
+        return savedState;
+    }
+
     function loadSavePoint() {
 
         try {
-            let savedState = window.localStorage.getItem('save-state');
-            if (savedState) {
-                story.state.LoadJson(savedState);
-                return true;
-            }
+            // readValidSave() 校验通过时已经把存档载进 story 了
+            if (readValidSave()) return true;
         } catch (e) {
             console.debug("Couldn't load save state");
         }
@@ -402,6 +453,7 @@
         if (saveEl) saveEl.addEventListener("click", function(event) {
             try {
                 window.localStorage.setItem('save-state', savePoint);
+                window.localStorage.setItem('save-state-for', storyFingerprint());
                 document.getElementById("reload").removeAttribute("disabled");
                 window.localStorage.setItem('theme', document.body.classList.contains("dark") ? "dark" : "");
             } catch (e) {
@@ -421,8 +473,7 @@
             removeAll("p");
             removeAll("img");
             try {
-                let savedState = window.localStorage.getItem('save-state');
-                if (savedState) story.state.LoadJson(savedState);
+                readValidSave(); // 校验 + 载入（坏存档会被丢掉，页面不会白屏）
             } catch (e) {
                 console.debug("Couldn't load save state");
             }
