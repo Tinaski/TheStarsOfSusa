@@ -38,9 +38,13 @@
     setupTheme(globalTagTheme);
     var hasSave = loadSavePoint();
     setupButtons(hasSave);
+    setupAutosaveOnExit();
 
     // Set initial save point
     savePoint = story.state.toJson();
+
+    // 如果是自动续读，先把「上次读到这里」补上，再继续渲染
+    if (hasSave) restoreContext();
 
     // Kick off the start of the story!
     continueStory(true);
@@ -239,6 +243,8 @@
         if( !firstTime )
             scrollDown(previousBottomEdge);
 
+        // 读到这里（下一次选择点）就悄悄记一笔，意外重载后能接着读
+        scheduleAutosave();
     }
 
     function restart() {
@@ -418,6 +424,84 @@
         return false;
     }
 
+    // ------------------------------------------------------------------
+    // 自动存档（由 patch-inky-save.mjs 加入）
+    // ------------------------------------------------------------------
+    //  原模板只在玩家点 save 按钮时才写 localStorage。手机上切后台、锁屏、
+    //  内存吃紧时，浏览器会把标签页整个丢掉并在回来时**重新加载页面** ——
+    //  没有存档就意味着「读着读着回到开头」，只能按 restart 重来。
+    //  这里改成：每读到一处（一组新选项）就防抖写一次，切后台/关页面时立刻落盘，
+    //  于是任何一次意外重载都能接着读。重启（restart）之后写的自然也是新状态。
+    var autosaveTimer = null;
+    var autosaveContext = [];
+
+    /** 记住刚读过的几句话：恢复时显示在选项上方，免得读者「接不上」 */
+    function rememberContext() {
+        var paragraphs = storyContainer.querySelectorAll("p");
+        autosaveContext = [];
+        for (var i = Math.max(0, paragraphs.length - 3); i < paragraphs.length; i++) {
+            var text = paragraphs[i].textContent.trim();
+            if (text) autosaveContext.push(text);
+        }
+    }
+
+    function writeAutosave() {
+        if (autosaveTimer) { clearTimeout(autosaveTimer); autosaveTimer = null; }
+        try {
+            window.localStorage.setItem('save-state', story.state.toJson());
+            window.localStorage.setItem('save-state-for', storyFingerprint());
+            window.localStorage.setItem('save-context', JSON.stringify(autosaveContext));
+            var reloadButton = document.getElementById("reload");
+            if (reloadButton) reloadButton.removeAttribute("disabled");
+        } catch (e) {
+            console.debug("Couldn't autosave", e);
+        }
+    }
+
+    function scheduleAutosave() {
+        rememberContext();
+        if (autosaveTimer) clearTimeout(autosaveTimer);
+        autosaveTimer = setTimeout(writeAutosave, 400);
+    }
+
+    /**
+     * 自动续读时把「上次读到这里」的几句话补在选项上方。
+     * ink 的存档只记录"当前在哪"，不会重放读过正文，所以没有这一步的话，
+     * 读者重新打开只会看到孤零零的两个选项。
+     */
+    function restoreContext() {
+        var raw = null;
+        try { raw = window.localStorage.getItem('save-context'); } catch (e) { return; }
+        if (!raw) return;
+        var lines;
+        try { lines = JSON.parse(raw); } catch (e) { return; }
+        if (!lines || !lines.length) return;
+
+        var wrapper = document.createElement('div');
+        wrapper.className = "resumed";
+        wrapper.setAttribute("style", "margin: 0 0 6px; padding: 10px 12px; border-left: 3px solid rgba(150,130,90,0.5); opacity: 0.72;");
+        var label = document.createElement('p');
+        label.textContent = "—— 上次读到这里 ——";
+        label.setAttribute("style", "margin: 0 0 6px; font-size: 0.85em; opacity: 0.8;");
+        wrapper.appendChild(label);
+        for (var i = 0; i < lines.length; i++) {
+            var p = document.createElement('p');
+            p.textContent = lines[i];
+            p.setAttribute("style", "margin: 0 0 4px;");
+            wrapper.appendChild(p);
+        }
+        storyContainer.appendChild(wrapper);
+    }
+
+    /** 切后台 / 关闭页面时立刻落盘：移动端被系统回收前往往只有这一次机会 */
+    function setupAutosaveOnExit() {
+        window.addEventListener("pagehide", writeAutosave);
+        window.addEventListener("beforeunload", writeAutosave);
+        document.addEventListener("visibilitychange", function() {
+            if (document.visibilityState === "hidden") writeAutosave();
+        });
+    }
+
     // Detects which theme (light or dark) to use
     function setupTheme(globalTagTheme) {
 
@@ -442,7 +526,26 @@
     function setupButtons(hasSave) {
 
         let rewindEl = document.getElementById("rewind");
+        // restart 会清掉当前进度，所以做成「点两下」：第一次问一句，4 秒内再点一次才真的重开
+        var restartArmed = false;
+        var restartTimer = null;
         if (rewindEl) rewindEl.addEventListener("click", function(event) {
+            if (!restartArmed) {
+                restartArmed = true;
+                rewindEl.textContent = "确定重新开始？";
+                rewindEl.classList.add("is-armed");
+                if (restartTimer) clearTimeout(restartTimer);
+                restartTimer = setTimeout(function() {
+                    restartArmed = false;
+                    rewindEl.textContent = "restart";
+                    rewindEl.classList.remove("is-armed");
+                }, 4000);
+                return;
+            }
+            if (restartTimer) clearTimeout(restartTimer);
+            restartArmed = false;
+            rewindEl.textContent = "restart";
+            rewindEl.classList.remove("is-armed");
             removeAll("p");
             removeAll("img");
             setVisible(".header", false);
